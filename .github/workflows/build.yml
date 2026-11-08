@@ -1,0 +1,69 @@
+name: Build image
+
+# Pushes to main and PRs build the image (no push) so a broken patch or
+# dependency shows up early. A tag vX.Y.Z publishes it to GHCR as
+# ghcr.io/<owner>/mailhub-mcp:X.Y.Z, the tag the store compose pins.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/mailhub-mcp
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          cache-from: type=gha,scope=mcp
+          cache-to: type=gha,mode=max,scope=mcp
+
+  check-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install mcp==2.3.0 httpx==0.28.1 icalendar==7.3.0 vobject==0.9.9
+      - name: Read-only mode registers 7 tools
+        run: python check_tools.py
+        env: { MAILHUB_PASSWORD: dummy }
+      - name: Write mode registers 13 tools
+        run: python check_tools.py
+        env: { MAILHUB_PASSWORD: dummy, MAILHUB_MCP_WRITE: 'true' }
