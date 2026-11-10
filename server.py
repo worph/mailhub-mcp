@@ -50,7 +50,12 @@ from mcp.server.mcpserver.exceptions import ToolError  # message reaches the ass
 from mcp.server.transport_security import TransportSecuritySettings
 
 USER = os.environ.get("MAILHUB_USER", "admin")
+# The mailbox's own password: Baïkal (CalDAV/CardDAV) logs in with it. IMAP uses
+# Dovecot's master login when MAILHUB_MASTER_PASSWORD is set (MailHub 0.5.0+:
+# SASL PLAIN, authzid = USER), the same password otherwise.
 PASSWORD = os.environ["MAILHUB_PASSWORD"]
+MASTER_PASSWORD = os.environ.get("MAILHUB_MASTER_PASSWORD", "")
+MASTER_NAME = "mailhub-mcp"
 IMAP_HOST = os.environ.get("MAILHUB_IMAP_HOST", "mailhub-imap")
 IMAP_PORT = int(os.environ.get("MAILHUB_IMAP_PORT", "31143"))
 DAV_URL = os.environ.get("MAILHUB_DAV_URL", "http://mailhub-dav/dav.php").rstrip("/")
@@ -260,7 +265,10 @@ def _q(s: str) -> str:
 class _Imap:
     def __enter__(self) -> imaplib.IMAP4:
         self.m = imaplib.IMAP4(IMAP_HOST, IMAP_PORT, timeout=30)
-        self.m.login(USER, PASSWORD)
+        if MASTER_PASSWORD:
+            self.m.authenticate("PLAIN", lambda _: f"{USER}\0{MASTER_NAME}\0{MASTER_PASSWORD}".encode())
+        else:
+            self.m.login(USER, PASSWORD)
         try:
             self.m.enable("UTF8=ACCEPT")  # UTF-8 folder names and search terms
         except imaplib.IMAP4.error:
@@ -469,8 +477,12 @@ def mail_list_identities() -> list[dict[str, Any]]:
     for attempt in (1, 2):
         con = sqlite3.connect(f"file:{ROUNDCUBE_DB}?immutable=1", uri=True)
         try:
-            rows = con.execute("SELECT name, email, standard FROM identities WHERE del = 0 "
-                               "ORDER BY standard DESC, email").fetchall()
+            # This mailbox's only: every MailHub user has a Roundcube user row
+            # (users.username = the mailbox's user name).
+            rows = con.execute("SELECT i.name, i.email, i.standard FROM identities i "
+                               "JOIN users u ON u.user_id = i.user_id "
+                               "WHERE i.del = 0 AND u.username = ? "
+                               "ORDER BY i.standard DESC, i.email", (USER,)).fetchall()
             break
         except sqlite3.DatabaseError:
             if attempt == 2:
