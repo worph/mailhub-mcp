@@ -67,3 +67,5 @@ jobs:
       - name: Write mode registers 13 tools
         run: python check_tools.py
         env: { MAILHUB_PASSWORD: dummy, MAILHUB_MCP_WRITE: 'true' }
+      - name: The webmail's settings and the call history
+        run: python check_settings.py

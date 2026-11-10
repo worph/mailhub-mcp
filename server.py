@@ -6,9 +6,17 @@ Talks to MailHub's own services on the app's private network:
   - contacts  CardDAV on the built-in Baïkal
   - identities (the addresses you send from) read from Roundcube's DB, read-only
 
-Read-only unless MAILHUB_MCP_WRITE=true. Even then nothing is ever sent: the
+Read-only unless write access is on. Even then nothing is ever sent: the
 assistant writes a draft, and you send it from the webmail, where each identity
 goes out through its own provider's SMTP.
+
+Controlled from the webmail (Settings → AI assistant), through two folders:
+  - $MAILHUB_MCP_SETTINGS (settings.json, written by the webmail, read here on
+    every request): MCP on/off, write access, tools switched off, history cleared.
+    Without it: on, write access from MAILHUB_MCP_WRITE, every tool.
+  - $MAILHUB_MCP_LOG_DIR (written here, read by the webmail): tools.json, the
+    catalog the settings page lists; calls.jsonl, one line per tool call (time,
+    tool, shortened arguments, duration, outcome; never the result).
 """
 from __future__ import annotations
 
@@ -19,9 +27,12 @@ import email.policy
 import email.utils
 import html
 import imaplib
+import json
 import os
 import re
 import sqlite3
+import threading
+import time
 import uuid
 from email.message import EmailMessage
 from html.parser import HTMLParser
@@ -33,6 +44,8 @@ import httpx
 import icalendar
 import vobject
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.server import Context
+from mcp.types import CallToolResult, Tool as MCPTool
 from mcp.server.mcpserver.exceptions import ToolError  # message reaches the assistant
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -43,26 +56,198 @@ IMAP_PORT = int(os.environ.get("MAILHUB_IMAP_PORT", "31143"))
 DAV_URL = os.environ.get("MAILHUB_DAV_URL", "http://mailhub-dav/dav.php").rstrip("/")
 ROUNDCUBE_DB = os.environ.get("MAILHUB_ROUNDCUBE_DB", "/roundcube/sqlite.db")
 WRITE = os.environ.get("MAILHUB_MCP_WRITE", "false").lower() in ("1", "true", "yes")
+SETTINGS_FILE = os.path.join(os.environ.get("MAILHUB_MCP_SETTINGS", "/settings"), "settings.json")
+LOG_DIR = os.environ.get("MAILHUB_MCP_LOG_DIR", "/log")
+HISTORY_DAYS = int(os.environ.get("MAILHUB_MCP_HISTORY_DAYS", "30"))
+HISTORY_MAX = int(os.environ.get("MAILHUB_MCP_HISTORY_MAX", "5000"))
 try:  # the platform's $TZ is not always a valid zone name
     TZ = ZoneInfo(os.environ.get("MAILHUB_TZ") or "Etc/UTC")
 except Exception:
     TZ = ZoneInfo("Etc/UTC")
 
-server = MCPServer(
+WRITE_TOOLS: set[str] = set()
+
+
+# ----------------------------------------------------------------- settings ---
+_settings_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def settings() -> dict[str, Any]:
+    """The webmail's settings, re-read when the file changes. A missing or broken
+    file means the defaults: on, write access as MAILHUB_MCP_WRITE, every tool."""
+    global _settings_cache
+    out: dict[str, Any] = {"enabled": True, "write": WRITE, "disabled_tools": [], "cleared_at": None}
+    try:
+        mtime = os.stat(SETTINGS_FILE).st_mtime
+    except OSError:
+        return out
+    if _settings_cache is None or _settings_cache[0] != mtime:
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+        except (OSError, ValueError):
+            data = {}
+        _settings_cache = (mtime, data)
+    data = _settings_cache[1]
+    if isinstance(data.get("enabled"), bool):
+        out["enabled"] = data["enabled"]
+    if isinstance(data.get("write"), bool):
+        out["write"] = data["write"]
+    if isinstance(data.get("disabled_tools"), list):
+        out["disabled_tools"] = [t for t in data["disabled_tools"] if isinstance(t, str)]
+    if isinstance(data.get("cleared_at"), str):
+        out["cleared_at"] = data["cleared_at"]
+    return out
+
+
+def refusal(name: str, conf: dict[str, Any]) -> str | None:
+    """Why `name` may not be called now, or None."""
+    if not conf["enabled"]:
+        return "MailHub's MCP access is turned off (MailHub webmail: Settings → AI assistant)."
+    if name in WRITE_TOOLS and not conf["write"]:
+        return (f"{name} changes mail, calendar or contacts, and write access is off "
+                "(MailHub webmail: Settings → AI assistant).")
+    if name in conf["disabled_tools"]:
+        return f"{name} is turned off (MailHub webmail: Settings → AI assistant)."
+    return None
+
+
+# ------------------------------------------------------------------ history ---
+class History:
+    """calls.jsonl: one JSON object per call, appended; rewritten (temp file and
+    rename, so a reader never sees half of it) to drop calls older than
+    HISTORY_DAYS, beyond HISTORY_MAX, or from before the history was cleared."""
+
+    def __init__(self, folder: str):
+        self.path = os.path.join(folder, "calls.jsonl")
+        self.lock = threading.Lock()
+        self.lines: int | None = None  # counted on first use
+        self.cleared_at: str | None = None
+
+    def _usable(self) -> bool:
+        return os.path.isdir(os.path.dirname(self.path)) and os.access(os.path.dirname(self.path), os.W_OK)
+
+    def _prune(self, cleared_at: str | None) -> None:
+        cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=HISTORY_DAYS)).isoformat(timespec="seconds")
+        if cleared_at and cleared_at > cutoff:
+            cutoff = cleared_at
+        kept = []
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        if json.loads(line).get("ts", "") >= cutoff:
+                            kept.append(line if line.endswith("\n") else line + "\n")
+                    except ValueError:
+                        pass
+        except FileNotFoundError:
+            pass
+        kept = kept[-HISTORY_MAX:]
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, self.path)
+        self.lines = len(kept)
+
+    def add(self, entry: dict[str, Any], cleared_at: str | None) -> None:
+        if not self._usable():
+            return
+        with self.lock:
+            try:
+                if self.lines is None or cleared_at != self.cleared_at:
+                    self._prune(cleared_at)
+                    self.cleared_at = cleared_at
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                self.lines += 1
+                if self.lines > HISTORY_MAX * 1.2:
+                    self._prune(cleared_at)
+            except OSError:
+                pass  # the history never breaks a call
+
+
+def _short(value: Any, limit: int = 120) -> Any:
+    """Arguments as recorded: strings cut, lists cut to their first items."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + "…"
+    if isinstance(value, list):
+        return [_short(v, limit) for v in value[:10]] + (["…"] if len(value) > 10 else [])
+    if isinstance(value, dict):
+        return {k: _short(v, limit) for k, v in value.items()}
+    return value
+
+
+class MailHubServer(MCPServer):
+    """Lists only the tools the settings allow, refuses the others (a client may
+    still hold an older list), and records every call."""
+
+    async def list_tools(self) -> list[MCPTool]:
+        conf = settings()
+        return [t for t in await super().list_tools() if refusal(t.name, conf) is None]
+
+    async def call_tool(self, name: str, arguments: dict[str, Any], context: Context | None = None):
+        conf = settings()
+        entry: dict[str, Any] = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                                 "tool": name, "args": _short(arguments)}
+        started = time.monotonic()
+        try:
+            reason = refusal(name, conf)
+            if reason:
+                entry["refused"] = True
+                raise ToolError(reason)
+            result = await super().call_tool(name, arguments, context)
+            if isinstance(result, CallToolResult) and result.is_error:
+                entry["ok"] = False
+                entry["error"] = " ".join(getattr(c, "text", "") for c in result.content)[:300]
+            else:
+                entry["ok"] = True
+            return result
+        except Exception as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)[:300]
+            raise
+        finally:
+            entry["ms"] = round((time.monotonic() - started) * 1000)
+            history.add(entry, conf["cleared_at"])
+
+
+history = History(LOG_DIR)
+
+server = MailHubServer(
     name="mailhub",
     instructions=(
         "MailHub: the user's unified mailbox (every fetched account in one INBOX), "
         "calendar and contacts. Search before reading; read by uid+folder. "
-        + ("Write tools are enabled: drafts are saved to Drafts and never sent — "
-           "the user sends them from the webmail."
-           if WRITE else "Read-only: no tool changes mail, calendar or contacts.")
+        "Tools that change mail, calendar or contacts are listed only while the user "
+        "allows it (MailHub webmail: Settings → AI assistant); drafts are saved to "
+        "Drafts and never sent — the user sends them from the webmail."
     ),
 )
 
 
 def write_tool(fn):
-    """Register a tool only when write access is enabled."""
-    return server.tool()(fn) if WRITE else fn
+    """A tool that changes mail, calendar or contacts: listed and callable only while
+    write access is on."""
+    WRITE_TOOLS.add(fn.__name__)
+    return server.tool()(fn)
+
+
+def write_catalog() -> None:
+    """tools.json, for the settings page: every tool, whether it writes, its summary."""
+    if not os.access(LOG_DIR, os.W_OK):
+        return
+    tools = []
+    for t in server._tool_manager.list_tools():
+        tools.append({"name": t.name, "write": t.name in WRITE_TOOLS,
+                      "description": (t.description or "").strip().split("\n")[0]})
+    path = os.path.join(LOG_DIR, "tools.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump({"tools": tools, "write_default": WRITE}, f, ensure_ascii=False, indent=1)
+    os.chmod(path + ".tmp", 0o644)
+    os.replace(path + ".tmp", path)
 
 
 # --------------------------------------------------------------------- IMAP ---
@@ -555,6 +740,7 @@ def contacts_create(name: str, email_address: str = "", phone: str = "", organiz
 
 
 if __name__ == "__main__":
+    write_catalog()
     anyio.run(lambda: server.run_streamable_http_async(
         host="0.0.0.0", port=int(os.environ.get("PORT", "8080")),
         stateless_http=True, json_response=True,
